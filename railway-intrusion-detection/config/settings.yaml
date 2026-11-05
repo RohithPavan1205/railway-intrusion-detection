@@ -1,0 +1,44 @@
+system:
+  device: mps # Use 'mps' for Apple Silicon, 'cuda' for NVIDIA, 'cpu' for CPU
+  log_level: INFO
+
+streams:
+  optical:
+    source: "data/samples/optical_sample.mp4"
+    fps: 30
+    width: 640
+    height: 480
+  thermal:
+    source: "data/samples/thermal_sample.mp4"
+    fps: 30
+    width: 640
+    height: 480
+
+models:
+  optical:
+    weights: "models/optical/yolov8n.pt"
+    conf_threshold: 0.25
+    iou_threshold: 0.45
+  thermal:
+    weights: "models/thermal/yolov8n.pt" # Defaulting to n, but thermal-specific weights are better
+    conf_threshold: 0.25
+    iou_threshold: 0.45
+
+fusion:
+  enabled: true
+  sync_offset_ms: 0
+  iou_threshold: 0.3
+  calibration_enabled: false
+  homography_matrix: null # 3x3 matrix for spatial registration
+
+intrusion:
+  restricted_zones:
+    - name: "Track Zone 1"
+      polygon: [[100, 400], [540, 400], [600, 480], [40, 480]] # [x, y] coordinates
+  temporal_confirmation_frames: 5
+
+alerts:
+  audio_enabled: false
+  save_snapshots: true
+  snapshot_path: "outputs/snapshots/"
+  event_log_path: "outputs/events/events.csv"
