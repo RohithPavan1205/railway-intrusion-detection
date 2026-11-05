@@ -151,3 +151,4 @@ All 16 unit and integration tests validate:
 ## License
 
 This project is developed for research and educational purposes (Academic prototype — not safety-certified for actual railway operations).
+
