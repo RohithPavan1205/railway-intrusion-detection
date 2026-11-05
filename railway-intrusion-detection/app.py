@@ -580,6 +580,8 @@ def render_navbar():
     lat_ms = state["latency"] * 1000 if running and state and state["latency"] else 0.0
     events = len(state["events"]) if state else 0
     tracks = len(state["tracks"]) if state else 0
+    raw_dets = state.get("last_detections_count", 0) if state else 0
+    frames_n = state.get("processed_frames", 0) if state else 0
 
     has_intrusion = (
         system
@@ -613,6 +615,10 @@ def render_navbar():
                 <div class="stat-card">
                     <div class="s-num">{lat_ms:.0f} ms</div>
                     <div class="s-label">Latency</div>
+                </div>
+                <div class="stat-card">
+                    <div class="s-num" style="color: #2563EB;">{raw_dets}</div>
+                    <div class="s-label">Detections</div>
                 </div>
                 <div class="stat-card">
                     <div class="s-num" style="color: #6366F1;">{tracks}</div>

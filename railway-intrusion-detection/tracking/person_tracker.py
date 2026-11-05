@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 class Track:
-    def __init__(self, track_id, bbox, conf, min_hits=2):
+    def __init__(self, track_id, bbox, conf, min_hits=1):
         self.track_id = track_id
         self.bbox = list(bbox)
         self.conf = float(conf)
@@ -16,7 +16,7 @@ class Track:
         self.age = 0
         self.time_since_update = 0
         self.min_hits = min_hits
-        # Simple velocity estimate [vx, vy, vw, vh]
+        # Velocity estimate [vx, vy, vw, vh]
         self.velocity = [0.0, 0.0, 0.0, 0.0]
 
     def predict(self):
@@ -70,10 +70,10 @@ class PersonTracker:
     ByteTrack-inspired multi-stage association tracker:
     1. Associate high-confidence detections with active tracks using IoU & motion.
     2. Associate remaining low-confidence detections with remaining tracks to handle occlusions.
-    3. Initialize new tracks only from unassigned high-confidence detections.
-    4. Remove stale tracks exceeding max_age.
+    3. Initialize new tracks from unmatched detections.
+    4. Evict stale tracks exceeding max_age.
     """
-    def __init__(self, max_age=30, min_hits=2, high_thresh=0.5, match_thresh=0.3):
+    def __init__(self, max_age=30, min_hits=1, high_thresh=0.30, match_thresh=0.25):
         self.max_age = max_age
         self.min_hits = min_hits
         self.high_thresh = high_thresh
@@ -113,7 +113,7 @@ class PersonTracker:
         for track, det in matched_tracks_second:
             track.update(det['bbox'], det['conf'])
 
-        # Initialize new tracks only for unmatched HIGH-confidence detections
+        # Initialize new tracks for unmatched high-confidence detections
         for det in unmatched_high_dets:
             new_track = Track(self.next_id, det['bbox'], det['conf'], self.min_hits)
             self.tracks.append(new_track)
@@ -122,7 +122,7 @@ class PersonTracker:
         # Remove stale tracks that have been lost for too long
         self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
 
-        # Return only confirmed tracks that were updated recently
+        # Return confirmed tracks that were updated recently
         active_output = []
         for t in self.tracks:
             if t.is_confirmed and t.time_since_update <= 1:
@@ -145,13 +145,10 @@ class PersonTracker:
                 iou_matrix[i, j] = calculate_iou(track.bbox, det['bbox'])
 
         matched_tracks = []
-        unmatched_tracks = []
-        unmatched_dets = []
-
         assigned_tracks = set()
         assigned_dets = set()
 
-        # Greedy match from highest IoU down
+        # Match from highest IoU down
         while True:
             max_idx = np.unravel_index(np.argmax(iou_matrix), iou_matrix.shape)
             best_iou = iou_matrix[max_idx]
@@ -163,17 +160,11 @@ class PersonTracker:
             assigned_tracks.add(track_idx)
             assigned_dets.add(det_idx)
             
-            # Zero out this row and column
             iou_matrix[track_idx, :] = -1
             iou_matrix[:, det_idx] = -1
 
-        for i, track in enumerate(tracks):
-            if i not in assigned_tracks:
-                unmatched_tracks.append(track)
-
-        for j, det in enumerate(detections):
-            if j not in assigned_dets:
-                unmatched_dets.append(det)
+        unmatched_tracks = [t for i, t in enumerate(tracks) if i not in assigned_tracks]
+        unmatched_dets = [d for j, d in enumerate(detections) if j not in assigned_dets]
 
         return matched_tracks, unmatched_tracks, unmatched_dets
 

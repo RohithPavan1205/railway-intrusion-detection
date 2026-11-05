@@ -17,15 +17,15 @@ DEFAULT_CONFIG = {
     "models": {
         "optical": {
             "weights": "models/optical/yolov8n.pt",
-            "conf_threshold": 0.35,  # Balanced for person detection to avoid false positives
+            "conf_threshold": 0.20,  # Responsive default for distant/walking people
             "iou_threshold": 0.45,
-            "imgsz": 960,  # Higher resolution for detecting small/distant people
+            "imgsz": 640,  # Optimal speed/accuracy for real-time mobile/CCTV footage
         },
         "thermal": {
             "weights": "models/thermal/yolov8n.pt",
-            "conf_threshold": 0.35,
+            "conf_threshold": 0.20,
             "iou_threshold": 0.45,
-            "imgsz": 960,
+            "imgsz": 640,
         },
     },
     "tracking": {

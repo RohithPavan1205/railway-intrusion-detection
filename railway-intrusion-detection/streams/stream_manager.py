@@ -7,7 +7,10 @@ from .video_capture import VideoCapture
 
 logger = logging.getLogger(__name__)
 
+
 class StreamManager:
+    """Manages video capture threads with native resolution preservation."""
+
     def __init__(self, config):
         self.config = config
         self.queues = {}
@@ -18,19 +21,21 @@ class StreamManager:
 
     def _capture_loop(self, stream_name, source_config):
         logger.info(f"Starting capture loop for {stream_name}")
+        # Preserve native resolution by passing None for width & height
+        target_w = source_config.get("target_width", None)
+        target_h = source_config.get("target_height", None)
+        
         cap = VideoCapture(
-            source_config['source'], 
-            width=source_config['width'], 
-            height=source_config['height']
+            source_config["source"],
+            width=target_w,
+            height=target_h
         )
         
-        # Initial open
         opened = cap.open()
         self.status[stream_name] = "Connected" if opened else ("Missing" if cap.is_missing else "Disconnected")
         
         while self.running and not self._stop_event.is_set():
             if cap.is_missing:
-                # Don't retry local missing files
                 self._stop_event.wait(5)
                 continue
 
@@ -46,8 +51,10 @@ class StreamManager:
             ret, frame = cap.read()
             
             if not ret:
-                if any(ext in source_config['source'] for ext in [".mp4", ".avi", ".mkv"]):
+                # Video file reached EOF: loop back to frame 0 for continuous CCTV monitoring
+                if any(ext in source_config["source"] for ext in [".mp4", ".avi", ".mkv", ".mov"]):
                     cap.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    time.sleep(0.01)
                     continue
                 else:
                     self.status[stream_name] = "Disconnected"
@@ -61,6 +68,7 @@ class StreamManager:
                     pass
             
             self.queues[stream_name].put(frame)
+            time.sleep(0.005)
             
         cap.release()
 
@@ -69,12 +77,12 @@ class StreamManager:
             return
         self._stop_event.clear()
         self.running = True
-        selected_streams = set(enabled_streams or self.config['streams'].keys())
-        for name, conf in self.config['streams'].items():
+        selected_streams = set(enabled_streams or self.config["streams"].keys())
+        for name, conf in self.config["streams"].items():
             if name not in selected_streams:
                 self.status[name] = "Disabled"
                 continue
-            if not conf.get('source'):
+            if not conf.get("source"):
                 self.status[name] = "Not configured"
                 continue
             self.queues[name] = queue.Queue(maxsize=10)

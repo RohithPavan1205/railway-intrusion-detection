@@ -41,7 +41,7 @@ class RailwayIntrusionSystem:
         self.optical_det = OpticalDetector(self.config)
         self.thermal_det = ThermalDetector(self.config)
         self.fusion = LateFusion(self.config)
-        self.tracker = PersonTracker(max_age=30, min_hits=2, match_thresh=0.3)
+        self.tracker = PersonTracker(max_age=30, min_hits=1, high_thresh=0.30, match_thresh=0.25)
         self.zones = self._make_zones()
         self.intrusion_engine = IntrusionEngine(self.config, self.zones)
         self.alert_manager = AlertManager(self.config)
@@ -57,6 +57,7 @@ class RailwayIntrusionSystem:
             "latency": 0.0,
             "processing_active": False,
             "processed_frames": 0,
+            "last_detections_count": 0,
             "last_error": None,
         }
 
@@ -71,16 +72,16 @@ class RailwayIntrusionSystem:
         self.config = candidate
         self.streams.config = candidate
         
-        # Update detector hyperparameters
+        # Hyperparameters
         opt_cfg = candidate["models"]["optical"]
         self.optical_det.conf = opt_cfg["conf_threshold"]
         self.optical_det.iou = opt_cfg["iou_threshold"]
-        self.optical_det.imgsz = opt_cfg.get("imgsz", 960)
+        self.optical_det.imgsz = opt_cfg.get("imgsz", 640)
         
         thm_cfg = candidate["models"]["thermal"]
         self.thermal_det.conf = thm_cfg["conf_threshold"]
         self.thermal_det.iou = thm_cfg["iou_threshold"]
-        self.thermal_det.imgsz = thm_cfg.get("imgsz", 960)
+        self.thermal_det.imgsz = thm_cfg.get("imgsz", 640)
         
         self.fusion.iou_threshold = candidate["fusion"]["iou_threshold"]
         self.fusion.calibration_enabled = candidate["fusion"]["calibration_enabled"]
@@ -119,6 +120,7 @@ class RailwayIntrusionSystem:
             "tracks": [],
             "events": [],
             "processed_frames": 0,
+            "last_detections_count": 0,
             "fps": 0.0,
             "latency": 0.0,
             "optical_frame": None,
@@ -167,7 +169,6 @@ class RailwayIntrusionSystem:
                     self.alert_manager.trigger_alert(event, source_frame, matching_track["bbox"])
             
             latency = time.perf_counter() - started_at
-            # Exponential moving average for FPS
             current_fps = 1.0 / latency if latency > 0 else 0.0
             prev_fps = self.state["fps"]
             smoothed_fps = (0.2 * current_fps + 0.8 * prev_fps) if prev_fps > 0 else current_fps
@@ -179,6 +180,7 @@ class RailwayIntrusionSystem:
                 "events": self.intrusion_engine.get_history(),
                 "latency": latency,
                 "processed_frames": self.state["processed_frames"] + 1,
+                "last_detections_count": len(fused_detections),
                 "last_error": None,
                 "fps": smoothed_fps,
             })
@@ -211,18 +213,16 @@ class RailwayIntrusionSystem:
         # Draw restricted zone boundaries
         for zone in self.zones:
             cv2.polylines(image, [zone.polygon], isClosed=True, color=(0, 165, 255), thickness=2)
-            # Add zone name badge
             if len(zone.polygon) > 0:
                 zx, zy = zone.polygon[0]
                 cv2.putText(
                     image, zone.name, (max(10, zx), max(20, zy - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2, cv2.LINE_AA
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1, cv2.LINE_AA
                 )
 
         # Draw person tracks
         for track in tracks:
             x1, y1, x2, y2 = map(int, track["bbox"])
-            # Clamp inside frame
             x1 = max(0, min(w - 1, x1))
             y1 = max(0, min(h - 1, y1))
             x2 = max(0, min(w - 1, x2))
@@ -231,21 +231,20 @@ class RailwayIntrusionSystem:
             tid = track["track_id"]
             conf = track["conf"]
             
-            # Check intrusion status
             is_intruder = self.intrusion_engine.is_person_intruding(tid)
             box_color = (0, 0, 255) if is_intruder else (0, 255, 0)
-            thickness = 3 if is_intruder else 2
+            thickness = 2
 
             # Bounding box
             cv2.rectangle(image, (x1, y1), (x2, y2), box_color, thickness)
             
-            # Label background pill
+            # Label
             status_text = " [ALERT]" if is_intruder else ""
             label = f"ID:{tid} {conf:.2f}{status_text}"
             
-            font_scale = 0.5
+            font_scale = 0.45
             font_thickness = 1
-            (lbl_w, lbl_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+            (lbl_w, lbl_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
             
             lbl_y1 = max(lbl_h + 4, y1 - 4)
             lbl_y0 = lbl_y1 - lbl_h - 4
@@ -255,7 +254,7 @@ class RailwayIntrusionSystem:
                 cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA
             )
             
-            # Draw foot point indicator
+            # Foot point
             foot_x = (x1 + x2) // 2
             foot_y = y2
             cv2.circle(image, (foot_x, foot_y), 4, (0, 0, 255) if is_intruder else (255, 255, 0), -1)
