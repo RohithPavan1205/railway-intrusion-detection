@@ -6,7 +6,10 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 
 DEFAULT_CONFIG = {
-    "system": {"device": "cpu", "log_level": "INFO"},
+    "system": {
+        "device": "mps",  # Prefer Apple Silicon MPS, fallback to CPU
+        "log_level": "INFO",
+    },
     "streams": {
         "optical": {"source": "", "fps": 30, "width": 640, "height": 480, "enabled": True},
         "thermal": {"source": "", "fps": 30, "width": 640, "height": 480, "enabled": True},
@@ -14,14 +17,22 @@ DEFAULT_CONFIG = {
     "models": {
         "optical": {
             "weights": "models/optical/yolov8n.pt",
-            "conf_threshold": 0.25,
+            "conf_threshold": 0.35,  # Balanced for person detection to avoid false positives
             "iou_threshold": 0.45,
+            "imgsz": 960,  # Higher resolution for detecting small/distant people
         },
         "thermal": {
             "weights": "models/thermal/yolov8n.pt",
-            "conf_threshold": 0.25,
+            "conf_threshold": 0.35,
             "iou_threshold": 0.45,
+            "imgsz": 960,
         },
+    },
+    "tracking": {
+        "tracker": "bytetrack.yaml",
+        "persist": True,
+        "track_buffer": 30,  # Max frames to keep lost track before removing
+        "match_thresh": 0.7,
     },
     "fusion": {
         "enabled": False,
@@ -35,6 +46,7 @@ DEFAULT_CONFIG = {
             {"name": "Track Zone 1", "polygon": [[100, 400], [540, 400], [600, 480], [40, 480]]}
         ],
         "temporal_confirmation_frames": 5,
+        "cooldown_frames": 30,  # Prevent repeated alert flooding for continuous intrusion
     },
     "alerts": {
         "audio_enabled": False,

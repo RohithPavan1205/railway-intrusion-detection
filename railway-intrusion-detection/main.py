@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 import yaml
 
 from alerts.alert_manager import AlertManager
@@ -20,11 +21,10 @@ logger = logging.getLogger(__name__)
 
 
 class RailwayIntrusionSystem:
-    """Owns the detection pipeline for one Streamlit browser session."""
+    """Coordinates detection, ByteTrack tracking, and zone intrusion analysis."""
 
     def __init__(self, config_path=None, config=None):
         file_config = {}
-        # Locate settings.yaml flexibly (absolute or relative to BASE_DIR)
         target_path = Path(config_path) if config_path else BASE_DIR / "config" / "settings.yaml"
         if not target_path.exists():
             target_path = Path("config/settings.yaml")
@@ -35,38 +35,57 @@ class RailwayIntrusionSystem:
                     file_config = yaml.safe_load(config_file) or {}
             except Exception as e:
                 logger.warning(f"Could not load {target_path}, falling back to defaults: {e}")
-        
+
         self.config = normalize_config(deep_merge(file_config, config or {}))
         self.streams = StreamManager(self.config)
         self.optical_det = OpticalDetector(self.config)
         self.thermal_det = ThermalDetector(self.config)
         self.fusion = LateFusion(self.config)
-        self.tracker = PersonTracker()
+        self.tracker = PersonTracker(max_age=30, min_hits=2, match_thresh=0.3)
         self.zones = self._make_zones()
         self.intrusion_engine = IntrusionEngine(self.config, self.zones)
         self.alert_manager = AlertManager(self.config)
+        
         self.state = {
-            "optical_frame": None, "thermal_frame": None, "fused_frame": None,
-            "tracks": [], "events": [], "status": self.streams.get_status(),
-            "fps": 0.0, "latency": 0.0, "processing_active": False,
-            "processed_frames": 0, "last_error": None,
+            "optical_frame": None,
+            "thermal_frame": None,
+            "fused_frame": None,
+            "tracks": [],
+            "events": [],
+            "status": self.streams.get_status(),
+            "fps": 0.0,
+            "latency": 0.0,
+            "processing_active": False,
+            "processed_frames": 0,
+            "last_error": None,
         }
 
     def _make_zones(self):
-        return [TrackZone(zone["name"], zone["polygon"])
-                for zone in self.config["intrusion"]["restricted_zones"]]
+        zones = []
+        for zone in self.config["intrusion"]["restricted_zones"]:
+            zones.append(TrackZone(zone["name"], zone["polygon"]))
+        return zones
 
     def update_config(self, changes):
         candidate = normalize_config(deep_merge(self.config, changes))
         self.config = candidate
         self.streams.config = candidate
-        self.optical_det.conf = candidate["models"]["optical"]["conf_threshold"]
-        self.optical_det.iou = candidate["models"]["optical"]["iou_threshold"]
-        self.thermal_det.conf = candidate["models"]["thermal"]["conf_threshold"]
-        self.thermal_det.iou = candidate["models"]["thermal"]["iou_threshold"]
+        
+        # Update detector hyperparameters
+        opt_cfg = candidate["models"]["optical"]
+        self.optical_det.conf = opt_cfg["conf_threshold"]
+        self.optical_det.iou = opt_cfg["iou_threshold"]
+        self.optical_det.imgsz = opt_cfg.get("imgsz", 960)
+        
+        thm_cfg = candidate["models"]["thermal"]
+        self.thermal_det.conf = thm_cfg["conf_threshold"]
+        self.thermal_det.iou = thm_cfg["iou_threshold"]
+        self.thermal_det.imgsz = thm_cfg.get("imgsz", 960)
+        
         self.fusion.iou_threshold = candidate["fusion"]["iou_threshold"]
         self.fusion.calibration_enabled = candidate["fusion"]["calibration_enabled"]
         self.fusion.homography = candidate["fusion"]["homography_matrix"]
+        
         self.zones = self._make_zones()
         self.intrusion_engine.zones = self.zones
         self.intrusion_engine.temporal_threshold = candidate["intrusion"]["temporal_confirmation_frames"]
@@ -94,42 +113,78 @@ class RailwayIntrusionSystem:
         self.state["status"] = self.streams.get_status()
 
     def reset_session(self):
-        self.tracker = PersonTracker()
-        self.intrusion_engine.intrusion_counts.clear()
-        self.intrusion_engine.active_events.clear()
-        self.intrusion_engine.event_history.clear()
-        self.state.update({"tracks": [], "events": [], "processed_frames": 0, "fps": 0.0,
-                           "latency": 0.0, "optical_frame": None, "thermal_frame": None,
-                           "fused_frame": None})
+        self.tracker.reset()
+        self.intrusion_engine.reset()
+        self.state.update({
+            "tracks": [],
+            "events": [],
+            "processed_frames": 0,
+            "fps": 0.0,
+            "latency": 0.0,
+            "optical_frame": None,
+            "thermal_frame": None,
+            "fused_frame": None,
+        })
 
     def run_step(self):
         if not self.state["processing_active"]:
             return False
+            
         started_at = time.perf_counter()
         optical_enabled = self.config["streams"]["optical"].get("enabled", True)
         thermal_enabled = self.config["streams"]["thermal"].get("enabled", True)
+        
         opt_frame = self.streams.get_frame("optical") if optical_enabled else None
         thm_frame = self.streams.get_frame("thermal") if thermal_enabled else None
         self.state["status"] = self.streams.get_status()
+        
         if opt_frame is None and thm_frame is None:
             return False
+            
         try:
+            # 1. Detection
             opt_detections = self.optical_det.detect(opt_frame) if opt_frame is not None else []
             thermal_detections = self.thermal_det.detect(thm_frame) if thm_frame is not None else []
+            
             fusion_enabled = self.config["fusion"].get("enabled", True) and opt_frame is not None and thm_frame is not None
-            fused_detections = self.fusion.fuse(opt_detections, thermal_detections) if fusion_enabled else opt_detections + thermal_detections
+            fused_detections = (
+                self.fusion.fuse(opt_detections, thermal_detections)
+                if fusion_enabled
+                else (opt_detections if opt_frame is not None else thermal_detections)
+            )
+            
+            # 2. Tracking (ByteTrack multi-stage association)
             tracks = self.tracker.update(fused_detections)
-            for event in self.intrusion_engine.process_tracks(tracks):
-                source_frame = opt_frame if opt_frame is not None else thm_frame
-                matching_track = next((track for track in tracks if track["track_id"] == event.person_id), None)
-                if matching_track is not None:
+            
+            # 3. Intrusion Analysis
+            new_events = self.intrusion_engine.process_tracks(tracks)
+            
+            # 4. Snapshot logging for confirmed new intrusions
+            source_frame = opt_frame if opt_frame is not None else thm_frame
+            for event in new_events:
+                matching_track = next((t for t in tracks if t["track_id"] == event.person_id), None)
+                if matching_track is not None and source_frame is not None:
                     self.alert_manager.trigger_alert(event, source_frame, matching_track["bbox"])
+            
             latency = time.perf_counter() - started_at
-            self.state.update({"optical_frame": opt_frame, "thermal_frame": thm_frame, "tracks": tracks,
-                               "events": self.intrusion_engine.get_history(), "latency": latency,
-                               "processed_frames": self.state["processed_frames"] + 1, "last_error": None,
-                               "fps": 1.0 / latency if latency > 0 else 0.0})
-            self.state["fused_frame"] = self._draw_fused_frame(opt_frame if opt_frame is not None else thm_frame, tracks)
+            # Exponential moving average for FPS
+            current_fps = 1.0 / latency if latency > 0 else 0.0
+            prev_fps = self.state["fps"]
+            smoothed_fps = (0.2 * current_fps + 0.8 * prev_fps) if prev_fps > 0 else current_fps
+
+            self.state.update({
+                "optical_frame": opt_frame,
+                "thermal_frame": thm_frame,
+                "tracks": tracks,
+                "events": self.intrusion_engine.get_history(),
+                "latency": latency,
+                "processed_frames": self.state["processed_frames"] + 1,
+                "last_error": None,
+                "fps": smoothed_fps,
+            })
+            
+            # 5. Render annotated output frame
+            self.state["fused_frame"] = self._draw_fused_frame(source_frame, tracks)
             return True
         except Exception as error:
             logger.exception("Processing step failed")
@@ -137,14 +192,72 @@ class RailwayIntrusionSystem:
             return False
 
     def _draw_fused_frame(self, frame, tracks):
+        """
+        Renders clear, uncluttered detection visualization:
+        - Green bounding boxes for normal pedestrians outside restricted zone.
+        - Red bounding boxes for confirmed track intruders.
+        - Track ID and confidence score clamped within image bounds.
+        - Orange polygon zone overlay with clear semi-transparent styling.
+        """
+        if frame is None:
+            return None
+            
         image = frame.copy()
         if len(image.shape) == 2:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-        for track in tracks:
-            x1, y1, x2, y2 = map(int, track["bbox"])
-            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(image, f"ID:{track['track_id']} {track['conf']:.2f}", (x1, max(15, y1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+        h, w = image.shape[:2]
+
+        # Draw restricted zone boundaries
         for zone in self.zones:
             cv2.polylines(image, [zone.polygon], isClosed=True, color=(0, 165, 255), thickness=2)
+            # Add zone name badge
+            if len(zone.polygon) > 0:
+                zx, zy = zone.polygon[0]
+                cv2.putText(
+                    image, zone.name, (max(10, zx), max(20, zy - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2, cv2.LINE_AA
+                )
+
+        # Draw person tracks
+        for track in tracks:
+            x1, y1, x2, y2 = map(int, track["bbox"])
+            # Clamp inside frame
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(h - 1, y1))
+            x2 = max(0, min(w - 1, x2))
+            y2 = max(0, min(h - 1, y2))
+            
+            tid = track["track_id"]
+            conf = track["conf"]
+            
+            # Check intrusion status
+            is_intruder = self.intrusion_engine.is_person_intruding(tid)
+            box_color = (0, 0, 255) if is_intruder else (0, 255, 0)
+            thickness = 3 if is_intruder else 2
+
+            # Bounding box
+            cv2.rectangle(image, (x1, y1), (x2, y2), box_color, thickness)
+            
+            # Label background pill
+            status_text = " [ALERT]" if is_intruder else ""
+            label = f"ID:{tid} {conf:.2f}{status_text}"
+            
+            font_scale = 0.5
+            font_thickness = 1
+            (lbl_w, lbl_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+            
+            lbl_y1 = max(lbl_h + 4, y1 - 4)
+            lbl_y0 = lbl_y1 - lbl_h - 4
+            cv2.rectangle(image, (x1, lbl_y0), (min(w - 1, x1 + lbl_w + 6), lbl_y1), box_color, -1)
+            cv2.putText(
+                image, label, (x1 + 3, lbl_y1 - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA
+            )
+            
+            # Draw foot point indicator
+            foot_x = (x1 + x2) // 2
+            foot_y = y2
+            cv2.circle(image, (foot_x, foot_y), 4, (0, 0, 255) if is_intruder else (255, 255, 0), -1)
+
         return image

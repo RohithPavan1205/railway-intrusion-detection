@@ -1,84 +1,182 @@
+"""Robust ByteTrack and IoU tracking for persistent pedestrian tracking."""
+
 import numpy as np
 import logging
 from fusion.late_fusion import calculate_iou
 
 logger = logging.getLogger(__name__)
 
+
 class Track:
-    def __init__(self, track_id, bbox, conf):
+    def __init__(self, track_id, bbox, conf, min_hits=2):
         self.track_id = track_id
-        self.bbox = bbox
-        self.conf = conf
+        self.bbox = list(bbox)
+        self.conf = float(conf)
         self.hits = 1
         self.age = 0
         self.time_since_update = 0
+        self.min_hits = min_hits
+        # Simple velocity estimate [vx, vy, vw, vh]
+        self.velocity = [0.0, 0.0, 0.0, 0.0]
 
     def predict(self):
-        # Simple prediction: bbox stays the same
+        """Advance track state by motion prediction."""
         self.age += 1
         self.time_since_update += 1
+        
+        # Apply velocity prediction to bbox
+        x1, y1, x2, y2 = self.bbox
+        vx, vy, vw, vh = self.velocity
+        w = x2 - x1
+        h = y2 - y1
+        new_x1 = x1 + vx
+        new_y1 = y1 + vy
+        new_x2 = new_x1 + w + vw
+        new_y2 = new_y1 + h + vh
+        self.bbox = [new_x1, new_y1, new_x2, new_y2]
         return self.bbox
 
     def update(self, bbox, conf):
-        self.bbox = bbox
-        self.conf = conf
+        """Update track with newly matched detection and update velocity."""
+        old_x1, old_y1, old_x2, old_y2 = self.bbox
+        new_x1, new_y1, new_x2, new_y2 = bbox
+        
+        # Exponential moving average for velocity
+        vx = new_x1 - old_x1
+        vy = new_y1 - old_y1
+        vw = (new_x2 - new_x1) - (old_x2 - old_x1)
+        vh = (new_y2 - new_y1) - (old_y2 - old_y1)
+        
+        alpha = 0.5
+        self.velocity = [
+            alpha * vx + (1 - alpha) * self.velocity[0],
+            alpha * vy + (1 - alpha) * self.velocity[1],
+            alpha * vw + (1 - alpha) * self.velocity[2],
+            alpha * vh + (1 - alpha) * self.velocity[3],
+        ]
+        
+        self.bbox = list(bbox)
+        self.conf = float(conf)
         self.time_since_update = 0
         self.hits += 1
 
+    @property
+    def is_confirmed(self):
+        return self.hits >= self.min_hits
+
+
 class PersonTracker:
-    def __init__(self, max_age=30, min_hits=3):
+    """
+    ByteTrack-inspired multi-stage association tracker:
+    1. Associate high-confidence detections with active tracks using IoU & motion.
+    2. Associate remaining low-confidence detections with remaining tracks to handle occlusions.
+    3. Initialize new tracks only from unassigned high-confidence detections.
+    4. Remove stale tracks exceeding max_age.
+    """
+    def __init__(self, max_age=30, min_hits=2, high_thresh=0.5, match_thresh=0.3):
         self.max_age = max_age
         self.min_hits = min_hits
+        self.high_thresh = high_thresh
+        self.match_thresh = match_thresh
         self.tracks = []
-        self.next_id = 0
+        self.next_id = 1
 
     def update(self, detections):
         """
         Update tracks with new detections.
         detections: list of {'bbox': [x1, y1, x2, y2], 'conf': score}
         """
-        # Predict next state for all tracks
+        if not detections and not self.tracks:
+            return []
+
+        # 1. Predict next state for all tracks
         for t in self.tracks:
             t.predict()
 
-        # Match detections to tracks using IoU
-        assigned_dets = set()
-        updated_tracks = set()
+        # Partition detections into high and low confidence
+        high_dets = [d for d in detections if d['conf'] >= self.high_thresh]
+        low_dets = [d for d in detections if d['conf'] < self.high_thresh]
 
-        # Sort detections by confidence (High-score first)
-        sorted_dets = sorted(detections, key=lambda x: x['conf'], reverse=True)
+        # First association: High-confidence detections with all tracks
+        matched_tracks, unmatched_tracks, unmatched_high_dets = self._associate(
+            self.tracks, high_dets, self.match_thresh
+        )
 
+        for track, det in matched_tracks:
+            track.update(det['bbox'], det['conf'])
+
+        # Second association: Low-confidence detections with remaining tracks (handles occlusion)
+        matched_tracks_second, remaining_tracks, _ = self._associate(
+            unmatched_tracks, low_dets, self.match_thresh * 0.8
+        )
+
+        for track, det in matched_tracks_second:
+            track.update(det['bbox'], det['conf'])
+
+        # Initialize new tracks only for unmatched HIGH-confidence detections
+        for det in unmatched_high_dets:
+            new_track = Track(self.next_id, det['bbox'], det['conf'], self.min_hits)
+            self.tracks.append(new_track)
+            self.next_id += 1
+
+        # Remove stale tracks that have been lost for too long
+        self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
+
+        # Return only confirmed tracks that were updated recently
+        active_output = []
         for t in self.tracks:
-            best_iou = 0
-            best_det_idx = -1
+            if t.is_confirmed and t.time_since_update <= 1:
+                active_output.append({
+                    'track_id': t.track_id,
+                    'bbox': t.bbox,
+                    'conf': t.conf
+                })
+        return active_output
+
+    def _associate(self, tracks, detections, threshold):
+        """Associates detections with tracks using IoU matching."""
+        if not tracks or not detections:
+            return [], list(tracks), list(detections)
+
+        # Compute cost/IoU matrix
+        iou_matrix = np.zeros((len(tracks), len(detections)), dtype=np.float32)
+        for i, track in enumerate(tracks):
+            for j, det in enumerate(detections):
+                iou_matrix[i, j] = calculate_iou(track.bbox, det['bbox'])
+
+        matched_tracks = []
+        unmatched_tracks = []
+        unmatched_dets = []
+
+        assigned_tracks = set()
+        assigned_dets = set()
+
+        # Greedy match from highest IoU down
+        while True:
+            max_idx = np.unravel_index(np.argmax(iou_matrix), iou_matrix.shape)
+            best_iou = iou_matrix[max_idx]
+            if best_iou < threshold or best_iou <= 0:
+                break
             
-            for i, det in enumerate(sorted_dets):
-                if i in assigned_dets:
-                    continue
-                
-                iou = calculate_iou(t.bbox, det['bbox'])
-                if iou > best_iou:
-                    best_iou = iou
-                    best_det_idx = i
+            track_idx, det_idx = max_idx
+            matched_tracks.append((tracks[track_idx], detections[det_idx]))
+            assigned_tracks.add(track_idx)
+            assigned_dets.add(det_idx)
             
-            if best_det_idx != -1 and best_iou > 0.3:
-                t.update(sorted_dets[best_det_idx]['bbox'], sorted_dets[best_det_idx]['conf'])
-                assigned_dets.add(best_det_idx)
-                updated_tracks.add(t)
+            # Zero out this row and column
+            iou_matrix[track_idx, :] = -1
+            iou_matrix[:, det_idx] = -1
 
-        # Create new tracks for unmatched detections
-        for i, det in enumerate(sorted_dets):
-            if i not in assigned_dets:
-                new_track = Track(self.next_id, det['bbox'], det['conf'])
-                self.tracks.append(new_track)
-                self.next_id += 1
+        for i, track in enumerate(tracks):
+            if i not in assigned_tracks:
+                unmatched_tracks.append(track)
 
-        # Remove old tracks
-        self.tracks = [t for t in self.tracks if t.time_since_update < self.max_age]
+        for j, det in enumerate(detections):
+            if j not in assigned_dets:
+                unmatched_dets.append(det)
 
-        # Return only tracks that have been seen enough times
-        return [{
-            'track_id': t.track_id,
-            'bbox': t.bbox,
-            'conf': t.conf
-        } for t in self.tracks if t.hits >= 1] # Using 1 for prototype responsiveness
+        return matched_tracks, unmatched_tracks, unmatched_dets
+
+    def reset(self):
+        self.tracks.clear()
+        self.next_id = 1
