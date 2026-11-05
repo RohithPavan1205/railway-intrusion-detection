@@ -3,7 +3,7 @@ import cv2
 import pandas as pd
 import streamlit as st
 
-from config_runtime import deep_merge, normalize_config
+from config_runtime import BASE_DIR, deep_merge, normalize_config
 from dashboard.runtime import ProcessingWorker
 from dashboard.uploads import inspect_video, save_uploaded_video
 from main import RailwayIntrusionSystem
@@ -431,8 +431,13 @@ initialize_session()
 with st.sidebar:
     st.markdown('<div class="sb-heading">Video Source</div>', unsafe_allow_html=True)
 
-    sample_optical = Path("data/samples/optical_sample.mp4")
-    sample_thermal = Path("data/samples/thermal_sample.mp4")
+    sample_optical = BASE_DIR / "data" / "samples" / "optical_sample.mp4"
+    if not sample_optical.exists():
+        sample_optical = Path("data/samples/optical_sample.mp4")
+
+    sample_thermal = BASE_DIR / "data" / "samples" / "thermal_sample.mp4"
+    if not sample_thermal.exists():
+        sample_thermal = Path("data/samples/thermal_sample.mp4")
 
     choices = {}
     if sample_optical.exists():
@@ -741,7 +746,9 @@ with tab_events:
             height=240,
         )
 
-        snap_dir = Path("outputs/snapshots")
+        snap_dir = BASE_DIR / "outputs" / "snapshots"
+        if not snap_dir.exists():
+            snap_dir = Path("outputs/snapshots")
         if snap_dir.exists():
             snaps = sorted(snap_dir.glob("*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)
             if snaps:

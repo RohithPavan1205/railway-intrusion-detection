@@ -1,11 +1,13 @@
 import logging
+import os
 import time
+from pathlib import Path
 
 import cv2
 import yaml
 
 from alerts.alert_manager import AlertManager
-from config_runtime import deep_merge, normalize_config
+from config_runtime import BASE_DIR, deep_merge, normalize_config
 from detection.optical_detector import OpticalDetector
 from detection.thermal_detector import ThermalDetector
 from fusion.late_fusion import LateFusion
@@ -20,9 +22,20 @@ logger = logging.getLogger(__name__)
 class RailwayIntrusionSystem:
     """Owns the detection pipeline for one Streamlit browser session."""
 
-    def __init__(self, config_path="config/settings.yaml", config=None):
-        with open(config_path, "r") as config_file:
-            file_config = yaml.safe_load(config_file) or {}
+    def __init__(self, config_path=None, config=None):
+        file_config = {}
+        # Locate settings.yaml flexibly (absolute or relative to BASE_DIR)
+        target_path = Path(config_path) if config_path else BASE_DIR / "config" / "settings.yaml"
+        if not target_path.exists():
+            target_path = Path("config/settings.yaml")
+
+        if target_path.exists():
+            try:
+                with open(target_path, "r") as config_file:
+                    file_config = yaml.safe_load(config_file) or {}
+            except Exception as e:
+                logger.warning(f"Could not load {target_path}, falling back to defaults: {e}")
+        
         self.config = normalize_config(deep_merge(file_config, config or {}))
         self.streams = StreamManager(self.config)
         self.optical_det = OpticalDetector(self.config)

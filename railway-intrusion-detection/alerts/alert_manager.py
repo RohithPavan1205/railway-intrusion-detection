@@ -3,6 +3,8 @@ import os
 import csv
 import logging
 import time
+from pathlib import Path
+from config_runtime import BASE_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -10,10 +12,16 @@ class AlertManager:
     def __init__(self, config):
         self.config = config
         self.save_snapshots = config['alerts']['save_snapshots']
-        self.snapshot_path = config['alerts']['snapshot_path']
-        self.event_log_path = config['alerts']['event_log_path']
+        
+        # Ensure paths are created properly whether relative to root or BASE_DIR
+        raw_snap = Path(config['alerts']['snapshot_path'])
+        self.snapshot_path = str(raw_snap if raw_snap.is_absolute() else (BASE_DIR / raw_snap))
+        
+        raw_log = Path(config['alerts']['event_log_path'])
+        self.event_log_path = str(raw_log if raw_log.is_absolute() else (BASE_DIR / raw_log))
         
         os.makedirs(self.snapshot_path, exist_ok=True)
+        os.makedirs(os.path.dirname(self.event_log_path), exist_ok=True)
         
         # Initialize event log file
         if not os.path.exists(self.event_log_path):

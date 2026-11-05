@@ -1,5 +1,8 @@
 import logging
+from pathlib import Path
 from ultralytics import YOLO
+
+from config_runtime import BASE_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -7,11 +10,17 @@ class OpticalDetector:
     def __init__(self, config):
         self.conf = config['models']['optical']['conf_threshold']
         self.iou = config['models']['optical']['iou_threshold']
-        weights = config['models']['optical']['weights']
+        weights_path = Path(config['models']['optical']['weights'])
         
-        logger.info(f"Loading Optical YOLO model: {weights}")
+        # Support both relative to BASE_DIR and direct cwd
+        if not weights_path.exists():
+            resolved = BASE_DIR / weights_path
+            if resolved.exists():
+                weights_path = resolved
+        
+        logger.info(f"Loading Optical YOLO model: {weights_path}")
         try:
-            self.model = YOLO(weights)
+            self.model = YOLO(str(weights_path))
         except Exception as e:
             logger.error(f"Failed to load optical model: {e}")
             raise
